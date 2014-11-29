@@ -5,11 +5,13 @@ import org.apache.hadoop.io.Text
 import org.apache.spark.SparkContext._
 import org.apache.spark.{SparkConf, SparkContext}
 
-object CorpusProcessor extends App {
+object CorpusProcessor {
   type ArticleTransformation = (String, String) => (String, String)
   type replacement = ((String, String), String)
-  val pattern = """^.+/(.+)$""".r
-  val expectedClasses = Set("Person", "Organisation", "Place")
+
+  def main(args: Array[String]) {
+
+    val expectedClasses = Set("Person", "Organisation", "Place")
 
     val sc = new SparkContext(new SparkConf().setAppName("Annotate Named Entities on Wikimedia texts"))
 
@@ -20,62 +22,78 @@ object CorpusProcessor extends App {
 
     val outPath = args(3)
 
-    val selectedClassesFile = sc textFile s"$baseDBpediaPath/instance_types_pt.ttl"
-    val selectedDBpediaClasses = selectedClassesFile.filter(!_.startsWith("#")).map(rdfObjects).filter({case(_, o) => o contains "dbpedia"})
-    val selectedClasses = selectedDBpediaClasses.map({case(s, o) => (s, className(o))}).filter({case(_, o) => expectedClasses contains o})
+    val doFilterReferences = (args.length == 4) || args(4).toBoolean
 
+    val selectedClassesFile = sc textFile s"$baseDBpediaPath/instance_types_pt.ttl"
+    val selectedDBpediaClasses = selectedClassesFile.filter(!_.startsWith("#")).map(rdfObjects).filter({ case (_, o) => o contains "dbpedia"})
+    val selectedClasses = selectedDBpediaClasses.map({ case (s, o) => (s, className(o))}).filter({ case (_, o) => expectedClasses contains o})
 
     /* REDIRECTS */
     val redirectPairsFile = sc textFile s"$baseDBpediaPath/redirects_transitive_pt.ttl"
-    val redirectPairs = redirectPairsFile map(rdfObjects(_).swap)
+    val redirectPairs = redirectPairsFile map (rdfObjects(_).swap)
 
-    val instancesClasses = redirectPairs join selectedClasses map {case(_, redirects) => redirects} union selectedClasses
+    val instancesClasses = redirectPairs join selectedClasses map { case (_, redirects) => redirects} union selectedClasses
     instancesClasses cache()
-
-    /* WIKIPEDIA ARTICLES */
-    /* Mantém somente artigos com referência às instâncias das classes selecionadas */
-
-    val wikiPagesFile = sc textFile s"$baseDBpediaPath/wikipedia_links_pt.ttl"
-    val wikiPages = wikiPagesFile.filter(_ contains "isPrimaryTopicOf").map(rdfObjects) // (dbpedia, wikipedia)
-
-    val wikiLinksFile = sc textFile s"$baseDBpediaPath/page_links_pt.ttl"
-    val wikiLinks = wikiLinksFile.filter(!_.startsWith("#")).map(rdfObjects(_).swap) //.partitionBy(new HashPartitioner(16))
-    val linkedClasses = wikiLinks.join(instancesClasses).map({ case (_, classes) => classes}).distinct() // (dbpedia,class)
-
-    val selectedPages = linkedClasses.join(wikiPages).map({case(dbpedia, (selectedClass, wikipage)) => (dbpedia, 0)}).distinct()
 
     /* Converte títulos em IRIs da DBpedia */
     val transformTitle = titleAsURI(language)
     val wikiDump = sc.sequenceFile(s"$baseWikimediaPath/part*", classOf[Text], classOf[Text])
-    val wikiArticles = wikiDump.map({case(t,b) =>(t.toString, b.toString)}).filter({case(_, b) => filterRedirect(b)}).map({case (t, b) => transformTitle(t, b)})
+    val wikiArticles = wikiDump.map({ case (t, b) => (t.toString, b.toString)}).filter({ case (_, b) => filterRedirect(b)}).map({ case (t, b) => transformTitle(t, b)})
 
-    /* Remove marcações da wiki markup language, mantendo somente marcações dos links internos. */
+
+    /* WIKIPEDIA ARTICLES */
+    /* Mantém somente artigos com referência às instâncias das classes selecionadas */
     val portugueseParser = wikiAsPlain(language)
-    val selectedArticles = wikiArticles.join(selectedPages).map({case(title, (body, _)) => portugueseParser(title, body)})
-    val plainArticles = selectedArticles.filter({case (_, body) => filterEmpty(body) && filterRedirect(body)})
+
+    val selectedArticles =
+      if (doFilterReferences) {
+        val wikiPagesFile = sc textFile s"$baseDBpediaPath/wikipedia_links_pt.ttl"
+        val wikiPages = wikiPagesFile.filter(_ contains "isPrimaryTopicOf").map(rdfObjects) // (dbpedia, wikipedia)
+
+        val wikiLinksFile = sc textFile s"$baseDBpediaPath/page_links_pt.ttl"
+        val wikiLinks = wikiLinksFile.filter(!_.startsWith("#")).map(rdfObjects(_).swap) //.partitionBy(new HashPartitioner(16))
+        val linkedClasses = wikiLinks.join(instancesClasses).map({ case (_, classes) => classes}).distinct() // (dbpedia,class)
+
+        val selectedPages = linkedClasses.join(wikiPages).map({ case (dbpedia, (selectedClass, wikipage)) => (dbpedia, 0)}).distinct()
+
+        /* Remove marcações da wiki markup language, mantendo somente marcações dos links internos. */
+        wikiArticles.join(selectedPages).map({ case (title, (body, _)) => portugueseParser(title, body)})
+      } else {
+        wikiArticles.map({ case (title, body) => portugueseParser(title, body)})
+      }
+
+    val plainArticles = selectedArticles.filter({ case (_, body) => filterEmpty(body) && filterRedirect(body)})
+
 
     /* Extrai instâncias com formas textuais para compor lista de nomes alternativos */
-    val allNames = plainArticles map {case (uri, text) => (uri, (allForms(text).distinct, text))}
-    val mentions = allNames flatMap {case (iri, (forms, text)) => forms map {form => (iri, form)} } map {case (iri, (instance, form)) => (instance, (iri, form))}
-    val mentionTypes = mentions join instancesClasses map {case (instance, ((iri, form), typeClass)) => (iri, ((form, instance), typeClass))}
+    val allNames = plainArticles map { case (uri, text) => (uri, (allForms(text).distinct, text))}
+    val mentions = allNames flatMap { case (iri, (forms, text)) => forms map { form => (iri, form)}} map { case (iri, (instance, form)) => (instance, (iri, form))}
+    val mentionTypes = mentions join instancesClasses map { case (instance, ((iri, form), typeClass)) => (iri, ((form, instance), typeClass))}
     val replacements = mentionTypes groupByKey()
 
     // Substituições da maior ocorrência para a menor ocorrência
-    val articlesAndReplacements = allNames join replacements map {case (iri, ((_, text), replaces)) => (iri, (text, replaces.toList.sortBy(-_._2.length)))}
-    val result = articlesAndReplacements map {case (iri, (text, replaceList)) => (iri, dropRemaining(doReplaceInArticle(text, replaceList)) )}
+    val articlesAndReplacements = allNames join replacements map { case (iri, ((_, text), replaces)) => (iri, (text, replaces.toList.sortBy(-_._2.length)))}
+    val result = articlesAndReplacements map { case (iri, (text, replaceList)) => (iri, dropRemaining(doReplaceInArticle(text, replaceList)))}
 
     val simplifier = simplifyLink()
 
     val prepare = prepareSentences()
 
-    val sentences = result.map({case(title, text) => simplifier(title, text) }).map({case(title, text) => prepare(title, text)._2})
+    val sentences = result.map({ case (title, text) => simplifier(title, text)}).map({ case (title, text) => prepare(title, text)._2})
 
     sentences saveAsTextFile s"$outPath/$language-sentences"
-  sc.stop()
+    sc.stop()
+  }
 
   def className(iri: String): String = {
-    val pattern(cName) = iri
-    cName
+    val pattern = """^.+/(.+)$""".r
+
+    if(iri == null) {
+      "Null"
+    } else {
+      val pattern(cName) = iri
+      cName
+    }
   }
 
   def rdfObjects(triple: String): (String, String) = {

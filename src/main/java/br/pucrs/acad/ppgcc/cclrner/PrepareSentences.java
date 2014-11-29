@@ -3,13 +3,14 @@ package br.pucrs.acad.ppgcc.cclrner;
 import edu.stanford.nlp.ling.HasWord;
 import edu.stanford.nlp.process.DocumentPreprocessor;
 
+import java.io.Serializable;
 import java.io.StringReader;
 import java.util.List;
 
 /**
  * Created by cristoferweber on 28/04/14.
  */
-public class PrepareSentences {
+public class PrepareSentences implements Serializable {
 
     public String map(String text) {
 

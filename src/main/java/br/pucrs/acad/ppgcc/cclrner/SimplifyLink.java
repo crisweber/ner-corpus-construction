@@ -4,12 +4,13 @@ import edu.stanford.nlp.ling.CoreLabel;
 import edu.stanford.nlp.process.CoreLabelTokenFactory;
 import edu.stanford.nlp.process.PTBTokenizer;
 
+import java.io.Serializable;
 import java.io.StringReader;
 
 /**
  * Created by cristoferweber on 25/04/14.
  */
-public class SimplifyLink {
+public class SimplifyLink implements Serializable {
 
     private static final String BEGIN_LINK_TAG = "<[";
     private static final String END_LINK_TAG = "]>";
